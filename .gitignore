@@ -1,0 +1,5 @@
+digests/
+feeds.txt
+newsy_instructions.txt
+__pycache__/
+*.pyc

@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""
+Paperboi — Shamelessly vibe coded Claude Code project to read Twitter feeds so I don't have to.
+"""
+
+import re
+import sys
+import time
+import logging
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import requests
+from xml.etree import ElementTree as ET
+from email.utils import parsedate_to_datetime
+
+LOOKBACK_HOURS = 24
+MAX_TWEETS_PER_USER = 20
+NITTER_INSTANCES = [
+    "https://nitter.net",
+    "https://nitter.privacydev.net",
+    "https://nitter.poast.org",
+    "https://nitter.catsarch.com",
+]
+OUTPUT_DIR = "digests"
+
+REQUEST_DELAY   = 1.5
+REQUEST_TIMEOUT = 15
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+def load_handles(feeds_path: str = "feeds.txt") -> list:
+    path = Path(feeds_path)
+    if not path.exists():
+        log.error("feeds.txt not found: %s", path.resolve())
+        sys.exit(1)
+    handles = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        h = line.strip().lstrip("@")
+        if h and not h.startswith("#"):
+            handles.append(h)
+    return handles
+
+
+def scrape_instance(handle: str, instance: str, cutoff: datetime):
+    url = f"{instance}/{handle}/rss"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; Paperboi/1.0)"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        log.debug("    %s unreachable: %s", instance, exc)
+        return None
+
+    try:
+        root = ET.fromstring(resp.text)
+    except ET.ParseError as exc:
+        log.debug("    %s XML parse error: %s", instance, exc)
+        return None
+
+    tweets = []
+    for item in root.findall(".//item"):
+        desc_el = item.find("description")
+        pub_el  = item.find("pubDate")
+
+        text = ""
+        if desc_el is not None and desc_el.text:
+            text = re.sub(r"<[^>]+>", " ", desc_el.text)
+            text = re.sub(r"\s+", " ", text).strip()
+
+        if not text:
+            continue
+
+        tweet_dt = None
+        if pub_el is not None and pub_el.text:
+            try:
+                tweet_dt = parsedate_to_datetime(pub_el.text)
+                if tweet_dt.tzinfo is None:
+                    tweet_dt = tweet_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+
+        if tweet_dt is not None and tweet_dt >= cutoff:
+            tweets.append({
+                "text": text,
+                "timestamp": tweet_dt.strftime("%Y-%m-%d %H:%M UTC"),
+            })
+
+    return tweets
+
+
+def scrape_handle(handle: str, cutoff: datetime) -> tuple:
+    for instance in NITTER_INSTANCES:
+        log.info("  @%-22s ← %s", handle, instance)
+        result = scrape_instance(handle, instance, cutoff)
+        time.sleep(REQUEST_DELAY)
+        if result is not None:
+            capped = result[:MAX_TWEETS_PER_USER]
+            log.info("    ✓ %d tweet(s) in the lookback window", len(capped))
+            return capped, True
+
+    log.warning("  @%s — all Nitter instances failed, skipping", handle)
+    return [], False
+
+
+def format_tweets(results: dict) -> str:
+    chunks = []
+    for handle, tweets in results.items():
+        if not tweets:
+            continue
+        chunks.append(f"=== @{handle} ===")
+        for t in tweets:
+            chunks.append(f"[{t['timestamp']}] {t['text']}")
+        chunks.append("")
+    return "\n".join(chunks)
+
+
+def main() -> None:
+    now      = datetime.now(tz=timezone.utc)
+    cutoff   = now - timedelta(hours=LOOKBACK_HOURS)
+    date_str = now.strftime("%Y-%m-%d")
+    run_time = now.strftime("%Y-%m-%d %H:%M UTC")
+
+    handles = load_handles()
+    if not handles:
+        log.error("No handles found in feeds.txt")
+        sys.exit(1)
+
+    log.info("=== Paperboi — %s ===", run_time)
+    log.info("Handles: %d  |  Lookback: %dh  |  Max tweets/user: %d",
+             len(handles), LOOKBACK_HOURS, MAX_TWEETS_PER_USER)
+
+    results    = {}
+    successful = []
+    failed     = []
+    empty      = []
+
+    for handle in handles:
+        tweets, ok = scrape_handle(handle, cutoff)
+        if not ok:
+            failed.append(handle)
+        else:
+            successful.append(handle)
+            if not tweets:
+                empty.append(handle)
+        results[handle] = tweets
+
+    tweets_text = format_tweets(results)
+
+    header = f"# Paperboi — {date_str}\n*{run_time}*\n\n"
+
+    footer_lines = ["", "---"]
+    with_tweets = [h for h in successful if h not in empty]
+    if with_tweets:
+        footer_lines.append("**Scraped (with tweets):** " + ", ".join(f"@{h}" for h in with_tweets))
+    if empty:
+        footer_lines.append("**Scraped (no tweets in window):** " + ", ".join(f"@{h}" for h in empty))
+    if failed:
+        footer_lines.append("**Failed to scrape:** " + ", ".join(f"@{h}" for h in failed))
+    footer_lines.append(f"*Generated by Paperboi · {run_time}*")
+
+    output = header + (tweets_text or "*No tweets collected for this time window.*") + "\n".join(footer_lines)
+
+    print("\n" + "─" * 72)
+    print(output)
+    print("─" * 72 + "\n")
+
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    out_path = Path(OUTPUT_DIR) / f"tweets_{date_str}.txt"
+    out_path.write_text(output, encoding="utf-8")
+    log.info("Tweets saved → %s", out_path)
+
+
+if __name__ == "__main__":
+    main()
